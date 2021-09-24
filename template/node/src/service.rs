@@ -47,6 +47,12 @@ impl sc_executor::NativeExecutionDispatch for ExecutorDispatch {
 		frontier_template_runtime::native_version()
 	}
 }
+/*sc_executor::native_executor_instance!(
+	pub Executor,
+	frontier_template_runtime::api::dispatch,
+	frontier_template_runtime::native_version,
+	frame_benchmarking::benchmarking::HostFunctions,
+);*/
 
 type FullClient =
 	sc_service::TFullClient<Block, RuntimeApi, NativeElseWasmExecutor<ExecutorDispatch>>;

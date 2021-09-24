@@ -30,7 +30,10 @@ use fc_rpc_core::{
 };
 use fp_rpc::{ConvertTransaction, EthereumRuntimeRPCApi, TransactionStatus};
 use futures::{future::TryFutureExt, StreamExt};
-use jsonrpc_core::{futures::future, BoxFuture, ErrorCode, Result};
+use jsonrpc_core::{
+	futures::future::{self, Future},
+	BoxFuture, ErrorCode, Result,
+};
 use sc_client_api::{
 	backend::{AuxStore, Backend, StateBackend, StorageProvider},
 	client::BlockchainEvents,
@@ -737,18 +740,18 @@ where
 		Ok(Bytes(vec![]))
 	}
 
-	fn send_transaction(&self, request: TransactionRequest) -> BoxFuture<Result<H256>> {
+	fn send_transaction(&self, request: TransactionRequest) -> BoxFuture<H256> {
 		let from = match request.from {
 			Some(from) => from,
 			None => {
 				let accounts = match self.accounts() {
 					Ok(accounts) => accounts,
-					Err(e) => return Box::pin(future::err(e)),
+					Err(e) => return Box::new(future::result(Err(e))),
 				};
 
 				match accounts.get(0) {
 					Some(account) => account.clone(),
-					None => return Box::pin(future::err(internal_err("no signer available"))),
+					None => return Box::new(future::err(internal_err("no signer available"))),
 				}
 			}
 		};
@@ -757,13 +760,13 @@ where
 			Some(nonce) => nonce,
 			None => match self.transaction_count(from, None) {
 				Ok(nonce) => nonce,
-				Err(e) => return Box::pin(future::err(e)),
+				Err(e) => return Box::new(future::result(Err(e))),
 			},
 		};
 
 		let chain_id = match self.chain_id() {
 			Ok(chain_id) => chain_id,
-			Err(e) => return Box::pin(future::err(e)),
+			Err(e) => return Box::new(future::result(Err(e))),
 		};
 
 		let message = ethereum::LegacyTransactionMessage {
@@ -785,7 +788,7 @@ where
 			if signer.accounts().contains(&from) {
 				match signer.sign(message, &from) {
 					Ok(t) => transaction = Some(t),
-					Err(e) => return Box::pin(future::err(e)),
+					Err(e) => return Box::new(future::result(Err(e))),
 				}
 				break;
 			}
@@ -793,7 +796,7 @@ where
 
 		let transaction = match transaction {
 			Some(transaction) => transaction,
-			None => return Box::pin(future::err(internal_err("no signer available"))),
+			None => return Box::new(future::result(Err(internal_err("no signer available")))),
 		};
 		let transaction_hash =
 			H256::from_slice(Keccak256::digest(&rlp::encode(&transaction)).as_slice());
@@ -806,17 +809,35 @@ where
 					self.convert_transaction
 						.convert_transaction(transaction.clone()),
 				)
-				.map_ok(move |_| transaction_hash)
+				.compat()
+				.map(move |_| {
+					if let Some(pending) = pending {
+						if let Ok(locked) = &mut pending.lock() {
+							locked.insert(
+								transaction_hash,
+								PendingTransaction::new(
+									transaction_build(transaction, None, None),
+									UniqueSaturatedInto::<u64>::unique_saturated_into(number),
+								),
+							);
+						}
+					}
+					transaction_hash
+				})
 				.map_err(|err| {
 					internal_err(format!("submit transaction to pool failed: {:?}", err))
 				}),
 		)
 	}
 
-	fn send_raw_transaction(&self, bytes: Bytes) -> BoxFuture<Result<H256>> {
+	fn send_raw_transaction(&self, bytes: Bytes) -> BoxFuture<H256> {
 		let transaction = match rlp::decode::<ethereum::TransactionV0>(&bytes.0[..]) {
 			Ok(transaction) => transaction,
-			Err(_) => return Box::pin(future::err(internal_err("decode transaction failed"))),
+			Err(_) => {
+				return Box::new(future::result(Err(internal_err(
+					"decode transaction failed",
+				))))
+			}
 		};
 		let transaction_hash =
 			H256::from_slice(Keccak256::digest(&rlp::encode(&transaction)).as_slice());
@@ -829,6 +850,7 @@ where
 					self.convert_transaction
 						.convert_transaction(transaction.clone()),
 				)
+
 				.map_ok(move |_| transaction_hash)
 				.map_err(|err| {
 					internal_err(format!("submit transaction to pool failed: {:?}", err))
@@ -1003,15 +1025,12 @@ where
 			Ok(used_gas)
 		};
 		if cfg!(feature = "rpc_binary_search_estimate") {
-			const MAX_OOG_PER_ESTIMATE_QUERY: u32 = 2;
-
 			let mut lower = U256::from(21_000);
 			// TODO: get a good upper limit, but below U64::max to operation overflow
 			let mut upper = U256::from(gas_limit);
 			let mut mid = upper;
 			let mut best = mid;
 			let mut old_best: U256;
-			let mut num_oog = 0;
 
 			// if the gas estimation depends on the gas limit, then we want to binary
 			// search until the change is under some threshold. but if not dependent,
@@ -1036,12 +1055,6 @@ where
 					Err(err) => {
 						// if Err == OutofGas, we need more gas
 						if err.code == ErrorCode::ServerError(0) {
-							num_oog += 1;
-							// don't try more than twice if we oog
-							if num_oog >= MAX_OOG_PER_ESTIMATE_QUERY {
-								return Err(err);
-							}
-
 							lower = mid;
 							mid = (lower + upper + 1) / 2;
 							if mid == lower {
@@ -1101,6 +1114,7 @@ where
 			self.client.as_ref(),
 			self.backend.as_ref(),
 			hash,
+			true,
 		)
 		.map_err(|err| internal_err(format!("{:?}", err)))?
 		{
@@ -1209,6 +1223,7 @@ where
 			self.client.as_ref(),
 			self.backend.as_ref(),
 			hash,
+			true,
 		)
 		.map_err(|err| internal_err(format!("{:?}", err)))?
 		{
